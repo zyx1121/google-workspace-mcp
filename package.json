@@ -1,6 +1,6 @@
 {
   "name": "@zyx1121/google-workspace-mcp",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "MCP server for Google Workspace — Drive, Docs, Sheets, Slides via Claude Code",
   "type": "module",
   "main": "./dist/index.js",
