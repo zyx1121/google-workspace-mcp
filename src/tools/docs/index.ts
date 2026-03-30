@@ -1,13 +1,19 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { docs_v1 } from "googleapis";
 import { z } from "zod";
+import mammoth from "mammoth";
 import { getDocs, getDrive, getAuth, parseFileId } from "../../auth.js";
 import { success, error, withErrorHandling } from "../../helpers.js";
 
-/** Walk document body and extract plain text */
+const OFFICE_DOC_TYPES = [
+  "application/vnd.openxmlformats-officedocument.wordprocessingml.document", // .docx
+  "application/msword", // .doc
+];
+
+// ── Google Docs API helpers ──────────────────────────────────────────
+
 function extractText(body: docs_v1.Schema$Body): string {
   const parts: string[] = [];
-
   for (const el of body.content || []) {
     if (el.paragraph) {
       const line = (el.paragraph.elements || [])
@@ -16,32 +22,26 @@ function extractText(body: docs_v1.Schema$Body): string {
       parts.push(line);
     } else if (el.table) {
       for (const row of el.table.tableRows || []) {
-        const cells = (row.tableCells || []).map((cell) => {
-          return (cell.content || [])
-            .flatMap((c) =>
-              (c.paragraph?.elements || []).map((e) => e.textRun?.content || ""),
-            )
+        const cells = (row.tableCells || []).map((cell) =>
+          (cell.content || [])
+            .flatMap((c) => (c.paragraph?.elements || []).map((e) => e.textRun?.content || ""))
             .join("")
-            .trim();
-        });
+            .trim(),
+        );
         parts.push("| " + cells.join(" | ") + " |");
       }
       parts.push("");
     }
   }
-
   return parts.join("").replace(/\n{3,}/g, "\n\n").trim();
 }
 
-/** Collect all inline object IDs from the document body */
 function collectImageIds(body: docs_v1.Schema$Body): string[] {
   const ids: string[] = [];
   for (const el of body.content || []) {
     if (el.paragraph) {
       for (const e of el.paragraph.elements || []) {
-        if (e.inlineObjectElement?.inlineObjectId) {
-          ids.push(e.inlineObjectElement.inlineObjectId);
-        }
+        if (e.inlineObjectElement?.inlineObjectId) ids.push(e.inlineObjectElement.inlineObjectId);
       }
     }
     if (el.table) {
@@ -49,9 +49,7 @@ function collectImageIds(body: docs_v1.Schema$Body): string[] {
         for (const cell of row.tableCells || []) {
           for (const c of cell.content || []) {
             for (const e of c.paragraph?.elements || []) {
-              if (e.inlineObjectElement?.inlineObjectId) {
-                ids.push(e.inlineObjectElement.inlineObjectId);
-              }
+              if (e.inlineObjectElement?.inlineObjectId) ids.push(e.inlineObjectElement.inlineObjectId);
             }
           }
         }
@@ -61,83 +59,101 @@ function collectImageIds(body: docs_v1.Schema$Body): string[] {
   return ids;
 }
 
-const OFFICE_DOC_TYPES = [
-  "application/vnd.openxmlformats-officedocument.wordprocessingml.document", // .docx
-  "application/msword", // .doc
-];
+// ── .docx binary download helper ─────────────────────────────────────
 
-/**
- * Ensure we have a native Google Doc ID.
- * If the file is a .docx/.doc, copy-convert it to Google Docs format first.
- * Returns { docId, tempCopyId } — caller must delete tempCopyId when done.
- */
-async function ensureGoogleDoc(fileId: string): Promise<{ docId: string; tempCopyId: string | null }> {
+async function downloadAsBuffer(fileId: string): Promise<Buffer> {
   const drive = getDrive();
-  const meta = await drive.files.get({ fileId, fields: "id, mimeType" });
-  const mime = meta.data.mimeType || "";
+  const res = await drive.files.get(
+    { fileId, alt: "media" },
+    { responseType: "arraybuffer" },
+  );
+  return Buffer.from(res.data as ArrayBuffer);
+}
 
-  if (!OFFICE_DOC_TYPES.includes(mime)) {
-    return { docId: fileId, tempCopyId: null };
-  }
+/** Detect if a file is an Office document */
+async function getFileMeta(fileId: string) {
+  const drive = getDrive();
+  const res = await drive.files.get({ fileId, fields: "id, name, mimeType" });
+  return { id: res.data.id!, name: res.data.name || "", mimeType: res.data.mimeType || "" };
+}
 
-  // Copy-convert to Google Docs
-  const copy = await drive.files.copy({
-    fileId,
-    requestBody: {
-      name: `_temp_conversion_${Date.now()}`,
-      mimeType: "application/vnd.google-apps.document",
+// ── mammoth-based .docx parsing ──────────────────────────────────────
+
+interface DocxImage {
+  base64: string;
+  mimeType: string;
+}
+
+async function parseDocx(buf: Buffer): Promise<{ text: string; html: string; images: DocxImage[] }> {
+  const images: DocxImage[] = [];
+
+  const result = await mammoth.convertToHtml(
+    { buffer: buf },
+    {
+      convertImage: mammoth.images.imgElement((image) => {
+        return image.read("base64").then((base64) => {
+          const mime = image.contentType || "image/png";
+          images.push({ base64, mimeType: mime });
+          return { src: `data:${mime};base64,${base64}` };
+        });
+      }),
     },
-    fields: "id",
-  });
+  );
 
-  const copyId = copy.data.id!;
-  return { docId: copyId, tempCopyId: copyId };
+  // Also get plain text
+  const textResult = await mammoth.extractRawText({ buffer: buf });
+
+  return {
+    text: textResult.value,
+    html: result.value,
+    images,
+  };
 }
 
-/** Delete a temporary file, silently ignoring errors */
-async function cleanupTemp(tempId: string | null) {
-  if (!tempId) return;
-  try {
-    const drive = getDrive();
-    await drive.files.delete({ fileId: tempId });
-  } catch {
-    // best-effort cleanup
-  }
-}
+// ── Tool registration ────────────────────────────────────────────────
 
 export function registerDocsTools(server: McpServer) {
   server.tool(
     "docs_read",
-    "Read a Google Doc or .docx file as structured text. Accepts a file ID or Google Docs URL. Office files (.docx) are auto-converted.",
+    "Read a Google Doc or .docx file as structured text. Accepts a file ID or Google Docs URL. Office files (.docx) are parsed locally via mammoth.",
     {
       file_id: z.string().min(1).describe("Google Docs file ID or URL"),
     },
     withErrorHandling(async ({ file_id }) => {
-      const docs = getDocs();
       const id = parseFileId(file_id);
-      const { docId, tempCopyId } = await ensureGoogleDoc(id);
+      const meta = await getFileMeta(id);
 
-      try {
-        const res = await docs.documents.get({ documentId: docId });
-
-        const title = res.data.title || "";
-        const text = res.data.body ? extractText(res.data.body) : "";
-
-        const imageIds = res.data.body ? collectImageIds(res.data.body) : [];
-        const imageCount = imageIds.length;
-
+      if (OFFICE_DOC_TYPES.includes(meta.mimeType)) {
+        // .docx → download and parse with mammoth
+        const buf = await downloadAsBuffer(id);
+        const { text, images } = await parseDocx(buf);
         return success({
           id,
-          title,
+          title: meta.name,
           text,
-          imageCount,
-          hint: imageCount > 0
-            ? `This document contains ${imageCount} image(s). Use docs_read_images to extract them.`
+          imageCount: images.length,
+          hint: images.length > 0
+            ? `This document contains ${images.length} image(s). Use docs_read_images to extract them.`
             : undefined,
         });
-      } finally {
-        await cleanupTemp(tempCopyId);
       }
+
+      // Native Google Doc → use Docs API
+      const docs = getDocs();
+      const res = await docs.documents.get({ documentId: id });
+      const title = res.data.title || "";
+      const text = res.data.body ? extractText(res.data.body) : "";
+      const imageIds = res.data.body ? collectImageIds(res.data.body) : [];
+
+      return success({
+        id,
+        title,
+        text,
+        imageCount: imageIds.length,
+        hint: imageIds.length > 0
+          ? `This document contains ${imageIds.length} image(s). Use docs_read_images to extract them.`
+          : undefined,
+      });
     }),
   );
 
@@ -150,16 +166,34 @@ export function registerDocsTools(server: McpServer) {
     },
     async ({ file_id, max_images }) => {
       try {
-        const docs = getDocs();
         const id = parseFileId(file_id);
-        const { docId, tempCopyId } = await ensureGoogleDoc(id);
+        const meta = await getFileMeta(id);
 
-        try {
-        const res = await docs.documents.get({ documentId: docId });
+        if (OFFICE_DOC_TYPES.includes(meta.mimeType)) {
+          // .docx → download and extract images with mammoth
+          const buf = await downloadAsBuffer(id);
+          const { images } = await parseDocx(buf);
 
+          const content: ({ type: "text"; text: string } | { type: "image"; data: string; mimeType: string })[] = [];
+          const extracted = Math.min(images.length, max_images);
+
+          content.push({
+            type: "text",
+            text: JSON.stringify({ documentId: id, title: meta.name, totalImages: images.length, extracted }, null, 2),
+          });
+
+          for (let i = 0; i < extracted; i++) {
+            content.push({ type: "image", data: images[i].base64, mimeType: images[i].mimeType });
+          }
+
+          return { content };
+        }
+
+        // Native Google Doc → use Docs API
+        const docs = getDocs();
+        const res = await docs.documents.get({ documentId: id });
         const inlineObjects = res.data.inlineObjects || {};
         const imageIds = res.data.body ? collectImageIds(res.data.body) : [];
-
         const client = await getAuth().getClient();
 
         const content: ({ type: "text"; text: string } | { type: "image"; data: string; mimeType: string })[] = [];
@@ -167,12 +201,8 @@ export function registerDocsTools(server: McpServer) {
 
         for (const [i, objId] of imageIds.entries()) {
           if (i >= max_images) break;
-
           const obj = inlineObjects[objId];
-          const props = obj?.inlineObjectProperties?.embeddedObject;
-          if (!props) continue;
-
-          const contentUri = props.imageProperties?.contentUri;
+          const contentUri = obj?.inlineObjectProperties?.embeddedObject?.imageProperties?.contentUri;
           if (!contentUri) continue;
 
           try {
@@ -188,18 +218,10 @@ export function registerDocsTools(server: McpServer) {
 
         content.unshift({
           type: "text",
-          text: JSON.stringify({
-            documentId: id,
-            title: res.data.title,
-            totalImages: imageIds.length,
-            extracted,
-          }, null, 2),
+          text: JSON.stringify({ documentId: id, title: res.data.title, totalImages: imageIds.length, extracted }, null, 2),
         });
 
         return { content };
-        } finally {
-          await cleanupTemp(tempCopyId);
-        }
       } catch (e) {
         return error(e instanceof Error ? e.message : String(e));
       }
@@ -208,46 +230,52 @@ export function registerDocsTools(server: McpServer) {
 
   server.tool(
     "docs_export",
-    "Export a Google Doc as HTML, plain text, or PDF. Accepts a file ID or URL.",
+    "Export a Google Doc or .docx as HTML, plain text, or PDF. Accepts a file ID or URL.",
     {
       file_id: z.string().min(1).describe("Google Docs file ID or URL"),
       format: z.enum(["html", "text", "pdf"]).default("html").describe("Export format"),
     },
     withErrorHandling(async ({ file_id, format }) => {
-      const drive = getDrive();
       const id = parseFileId(file_id);
-      const { docId, tempCopyId } = await ensureGoogleDoc(id);
+      const meta = await getFileMeta(id);
 
-      try {
-        const mimeMap = {
-          html: "text/html",
-          text: "text/plain",
-          pdf: "application/pdf",
-        };
-
-        const res = await drive.files.export({
-          fileId: docId,
-          mimeType: mimeMap[format],
-        });
+      if (OFFICE_DOC_TYPES.includes(meta.mimeType)) {
+        // .docx → download and convert with mammoth
+        const buf = await downloadAsBuffer(id);
 
         if (format === "pdf") {
-          const buf = Buffer.from(res.data as string, "binary");
           return success({
             id,
             format,
-            base64: buf.toString("base64"),
-            size: buf.length,
+            error: "PDF export from .docx is not supported. Use 'html' or 'text' format.",
           });
         }
 
-        return success({
-          id,
-          format,
-          content: String(res.data),
-        });
-      } finally {
-        await cleanupTemp(tempCopyId);
+        if (format === "html") {
+          const result = await mammoth.convertToHtml({ buffer: buf });
+          return success({ id, format, content: result.value });
+        }
+
+        const result = await mammoth.extractRawText({ buffer: buf });
+        return success({ id, format, content: result.value });
       }
+
+      // Native Google Doc → use Drive export API
+      const drive = getDrive();
+      const mimeMap = {
+        html: "text/html",
+        text: "text/plain",
+        pdf: "application/pdf",
+      };
+
+      const res = await drive.files.export({ fileId: id, mimeType: mimeMap[format] });
+
+      if (format === "pdf") {
+        const pdfBuf = Buffer.from(res.data as string, "binary");
+        return success({ id, format, base64: pdfBuf.toString("base64"), size: pdfBuf.length });
+      }
+
+      return success({ id, format, content: String(res.data) });
     }),
   );
 }
