@@ -6,12 +6,11 @@ import { registerPermissionTools } from "./tools/drive/permissions.js";
 import { registerDocsTools } from "./tools/docs/index.js";
 import { registerSheetsTools } from "./tools/sheets/index.js";
 import { registerSlidesTools } from "./tools/slides/index.js";
-import { registerImageTools } from "./tools/image/index.js";
 
 export function createServer(): McpServer {
   const server = new McpServer({
     name: "google-workspace",
-    version: "0.2.0",
+    version: "0.3.1",
   });
 
   registerFileTools(server);
@@ -21,7 +20,6 @@ export function createServer(): McpServer {
   registerDocsTools(server);
   registerSheetsTools(server);
   registerSlidesTools(server);
-  registerImageTools(server);
 
   return server;
 }
